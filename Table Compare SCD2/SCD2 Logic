@@ -1,0 +1,519 @@
+class DatasetConfigs:
+
+    def __init__(self):
+        self.scdt2_config = {}
+    
+    # create nested dict of {source.dataset = {val=val}}
+    def add_config(self, source, dataset, **kwargs):
+        k = f'{source}.{dataset}'
+        if k not in self.scdt2_config.keys():
+            self.scdt2_config[k] = {}
+        self.scdt2_config[f'{source}.{dataset}'].update(kwargs)
+
+    # return all config for a dataset or just the requested value
+    def get_config(self, source, dataset, val=None):
+
+        if f'{source}.{dataset}' not in self.scdt2_config.keys():
+            raise Exception(f"{source}.{dataset} is not a valid scd2 table. must be one of: {self.scdt2_config.keys()}")
+
+        if val is None:
+            return self.scdt2_config[f'{source}.{dataset}']
+        return self.scdt2_config[f'{source}.{dataset}'][val]
+
+    def build(self):
+        return self \
+            .add_ims()
+
+
+
+    
+    def add_ims(self):
+
+        source_ims = 'ims'
+        tags = 'Exploratory'
+
+        self.add_config(source=source_ims
+            , dataset='r_Warrant_Person'
+            , filename='r_Warrant_Person.parquet'
+            , pk=['notification_pk','other_pk']
+            , sql=f"""
+                select 	
+                    concat(upper('{source_ims}'),'WARRANT',notification_pk) as notification_pk
+                    , concat(upper('{source_ims}'),other_pk) as other_pk  
+                    , primary_label_to                  
+                    , dateFrom
+                    , upper(type) as type
+                    , upper(linkCreatedBy) as linkCreatedBy
+                    , upper('{source_ims}') as source
+                    , '{tags}' as tags
+                from tmp_df
+                where 
+                    notification_pk is not null
+                    and other_pk is not null
+            """)
+
+ 
+
+        return self
+
+
+class EnvironmentConfig:
+
+    def __init__(self):
+
+        self.synapse_sa = self.get_sac('LS_SynapseDatalakeStorage')
+        self.hume_sa = self.get_sac('LS_IRISDatalakeStorage')
+        self.test = False
+        self.test_path = 'test'
+
+        self.stage_root = f"abfss://synapse@{self.synapse_sa}.dfs.core.windows.net/GraphETL/stage/"
+        self.test_stage_root = f"abfss://synapse@{self.synapse_sa}.dfs.core.windows.net/{self.test_path}/GraphETL/stage/"
+
+        self.raw_root = f"abfss://synapse@{self.synapse_sa}.dfs.core.windows.net/GraphETL/raw/"
+        self.test_raw_root = f"abfss://synapse@{self.synapse_sa}.dfs.core.windows.net/{self.test_path}/GraphETL/raw/"
+
+        self.curated_graph_root = f"abfss://synapse@{self.synapse_sa}.dfs.core.windows.net/GraphETL/curated/graph"
+        self.test_curated_graph_root = f"abfss://synapse@{self.synapse_sa}.dfs.core.windows.net/{self.test_path}/GraphETL/curated/graph"
+
+        self.yaml_root = f'abfss://synapse@{self.synapse_sa}.dfs.core.windows.net/GraphETL/parser/'
+        self.test_yaml_root = f'abfss://synapse@{self.synapse_sa}.dfs.core.windows.net/{self.test_path}/GraphETL/parser/'
+
+        self.json_path_root = f'abfss://synapse@{self.hume_sa}.dfs.core.windows.net/cypher/'
+        self.test_json_path_root = f'abfss://synapse@{self.hume_sa}.dfs.core.windows.net/{self.test_path}/cypher/'
+
+        self.ctl_dataset = {"table": "ctl_dataset", "database":"graph", "expectations":"expectations"}
+        self.test_ctl_dataset = {"table": "ctl_dataset", "database":"graph_test", "expectations":"expectations"}
+
+        
+    def get_json_path_root(self, target_db, source):
+        if not self.test:
+            return f'{self.json_path_root}{target_db}/{source}/'
+
+        return f'{self.test_json_path_root}{target_db}/{source}/'
+
+    def get_source_stage_root(self, source):
+        if not self.test:
+            return self.stage_root + source + '/'
+
+        return self.test_stage_root + source + '/'
+
+    def get_source_raw_root(self, source):
+        if not self.test:
+            return self.raw_root + source + '/'
+
+        return self.test_raw_root + source + '/'
+
+
+    def get_curated_graph_root(self):
+
+        if not self.test:
+            return self.curated_graph_root
+
+        return self.test_curated_graph_root
+    
+
+    def get_yaml_root(self, source):
+        if not self.test:
+            return self.yaml_root + source + '/'
+
+        return self.test_yaml_root + source + '/'
+
+    def get_ctl_dataset(self):
+        if not self.test:
+            return self.ctl_dataset
+
+        return self.test_ctl_dataset
+    
+    
+    
+    # return the storage account for a linked service
+    # currently either LS_SynapseDatalakeStorage or LS_HumeDatalakeStorage
+    def get_sac(self, linked_service):
+        conf_prefix = 'spark.storage.synapse.'
+        len_suffix = len('.dfs.core.windows.net.linkedServiceName')
+        len_prefix = len(conf_prefix)
+
+        all_conf = spark.sparkContext.getConf().getAll()
+
+        # loop through all config - adding to the sa_ls dict matching the prefix specified
+        # dict: key = conf_value, value = storage account named stripped from conf param
+        sa_ls = {i[1]: i[0][len_prefix:-len_suffix] for i in all_conf if i[0][0:len_prefix] == conf_prefix}
+        
+        return sa_ls[linked_service]
+
+
+
+
+import pyspark.sql.functions as F
+import pyspark.sql.types as T
+
+# @dataclass
+# class Step():
+#   df: pyDF=None
+#   vw: str=None
+
+#   def result(self):
+#     raise NotImplementedError()
+
+
+class Dataset(Step):
+
+  def result(self, file_path):
+    self.df = spark.read.parquet(file_path, header=True, escape='')
+    return self
+
+
+class Fresh(Step):
+
+  def result(self, dataset_step: Dataset, sql_stmt):
+    dataset_step.df.createOrReplaceTempView('tmp_df')
+    _ = spark.sql(sql_stmt)
+    self.df = _.toDF(*[c.lower() for c in _.columns])
+    return self
+
+## This step is replaced with ComparePostPreRowCount
+# class FailIfNoRowsReturned(Step):
+
+#   def result(self, fresh_step: Fresh, source, dataset):
+#     df = fresh_step.df
+#     row_count = df.count()
+    
+#     if row_count == 0:
+#         print(f"No rows returned for dataset {source}.{dataset}!")
+#     else:
+#         print(f"{row_count} rows returned for dataset {source}.{dataset}")
+
+#     return self
+#     #     notebook_name = mssparkutils.runtime.context.get('notebookname')
+#     #     error_message = f'Error in notebook {notebook_name} for dataset {source}.{dataset}! No rows returned!'
+#     #     raise ValueError(error_message)
+
+#     # return self
+
+class CheckDupes(Step):
+
+  def result(self, fresh_step: Fresh, pk, source, dataset):
+    df = fresh_step.df
+    dupes = df.groupBy(pk).count().where('count > 1').head(10)
+
+    if dupes:
+        notebook_name = mssparkutils.runtime.context.get('notebookname')
+        error_message = f'Error in notebook {notebook_name} for dataset {source}.{dataset}! Duplicate primary keys found (first 10):\n{dupes}'
+        raise ValueError(error_message)
+
+    return self
+
+
+class CreateIfNotExist(Step):
+
+  def table_exists(self, table: str, database: str = "default") -> bool:
+    
+    tbl = spark.sql(f"show tables in `{database}`") \
+      .filter(f"tableName = '{table.lower()}'")
+    return tbl.count() > 0
+
+  def result(self, fresh: Fresh, source, dataset, stage_root):
+    # Create if not exist
+    df = fresh.df
+
+    spark.sql(f"create database if not exists {source}")
+
+    # create the new table schema based on the dataset and scd t2 fields
+    if not self.table_exists(dataset, source):
+
+      empty_schema = [i for i in df.schema] 
+      scdt2_schema = [ T.StructField("valid_from", T.TimestampType(), True),
+                            T.StructField("valid_to", T.TimestampType(), True),
+                            T.StructField("row_hash", T.StringType(), True),
+                            T.StructField("pk_hash", T.StringType(), True)]
+      dataset_schema = T.StructType(scdt2_schema + empty_schema)
+
+
+      init_df = spark.createDataFrame(data=[], schema=dataset_schema)
+      init_df.write.format("delta").option("path", stage_root + dataset).saveAsTable(f'{source}.{dataset}')
+      print('Initial load successful! \n\t->Table:',dataset,' \n\t-> Rows written:', init_df.count())
+
+
+
+    return self
+
+class PostImage(Step):
+
+  def result(self, fresh_step: Fresh, pk):
+    
+    df = fresh_step.df
+    # non pk fields
+    value_fields = [i.lower() for i in df.columns if i.lower() not in pk]
+    
+    # calculate hashes in fresh data, move hashes to front of dataframe
+    self.df = df.withColumn("row_hash", sha2(concat_ws("||", *value_fields), 256)) \
+      .withColumn("pk_hash", sha2(concat_ws("||", *pk), 256))
+    self.df = self.df.select(self.df.columns[-2:]+self.df.columns[:-2])
+
+    # create views
+    self.vw = "post_image_vw"
+    self.df.createOrReplaceTempView(self.vw)
+
+    # caching for speed during development, may be useful in prod runs
+    self.df.cache()
+    
+    return self
+
+
+class PreImage(Step):
+
+  def result(self, source, dataset):
+    self.df = spark.sql(f"select * from {source}.{dataset} where valid_to is null")
+    return self
+
+
+class ComparePostPreRowCount(Step):
+    def result(self, post_image_step: PostImage, pre_image_step: PreImage, raise_on_zero_postimage=True):
+        post_image_count = post_image_step.df.count()
+        pre_image_count = pre_image_step.df.count()
+
+        if post_image_count == 0 and pre_image_count != 0:
+            if raise_on_zero_postimage:
+                raise Exception("Parquet count is zero while current table count is not!")
+            else:
+                print(f"Warning: Parquet count is zero while current table count is not!")
+        elif post_image_count == 0 and pre_image_count == 0:
+            print("Both PostImage and PreImage counts are zero.")
+        else:
+            print(f"PostImage count: {post_image_count}, PreImage count: {pre_image_count}")
+
+        return self
+# class ComparePostPreRowCount(Step):
+#     def result(self, post_image_step: PostImage, pre_image_step: PreImage):
+#         post_image_count = post_image_step.df.count()
+#         pre_image_count = pre_image_step.df.count()
+
+#         if post_image_count == 0 and pre_image_count != 0:
+#             raise Exception("Parquet count is zero while current table count is not!")
+#         elif post_image_count == 0 and pre_image_count == 0:
+#             print("Both PostImage and PreImage counts are zero.")
+#         else:
+#             print(f"PostImage count: {post_image_count}, PreImage count: {pre_image_count}")
+
+#         return self
+
+
+class UnionedHashes(Step):
+
+  def result(self, post_image_step: PostImage, pre_image_step: PreImage):
+
+    _post_image = post_image_step.df
+    _pre_image = pre_image_step.df
+
+    # union the pre and post pk and row hash fields
+    self.df = _post_image.select("pk_hash", "row_hash").withColumn('table_id', lit(2)) \
+    .union(_pre_image.select("pk_hash", "row_hash").withColumn('table_id', lit(1))) 
+    
+    self.vw = "unioned_hashes"
+    
+    self.df.createOrReplaceTempView(self.vw)
+
+    return self
+
+
+class RowOps(Step):
+
+  def result(self, unioned_hashes_step: UnionedHashes, now_utc):
+    # inject static time value so that merge and insert reflect same valid_to/valid_from timestamp
+    
+    
+    # note that count and max id are added in the case statement for simplicity
+    # see the case statement in the pseudo code for why this works
+    self.df = spark.sql(f"""
+      select 
+        pk_hash
+        , case count(*) + max(table_id)
+          when 2 then 'D' -- one row that only exists in pre -> delete
+          when 3 then 'I' -- one row that only exists in post -> insert
+          else 'U' -- two rows that exists in both -> update
+        end as operation
+        , to_timestamp('"""+now_utc+f"""') as utc_timestamp
+      from 
+        {unioned_hashes_step.vw}
+      group by 
+        pk_hash 
+      having 
+        not (count(*) = 2 and count(distinct row_hash) = 1) -- remove rows where pre and post are unchanged
+    """)
+
+    self.df.cache() # this is probably a good idea
+    self.vw = "rowops_vw"
+    self.df.createOrReplaceTempView(self.vw)
+    
+    return self
+
+
+class Merge(Step):
+
+  def result(self, rowops_step: RowOps, source, dataset):
+    # valid_to timestamp for deleted and updated rows no longer 'current'
+    merge_sql = f"""
+      merge into {source}.{dataset} a
+      using (select pk_hash, utc_timestamp from {rowops_step.vw} b where b.operation in ('U', 'D')) as m
+      on a.pk_hash = m.pk_hash and a.valid_to is null -- only update 'active' records
+      when matched then
+        update set
+          a.valid_to = m.utc_timestamp
+    """
+
+    self.df = spark.sql(merge_sql)
+
+    return self
+
+
+class Insert(Step):
+
+  def result(self, post_image_step, rowops_step, source, dataset):
+
+    insert_sql = f"""
+      insert into {source}.{dataset}
+      select 
+        b.utc_timestamp as valid_from
+        , null as valid_to
+        , a.*
+      from 
+        {post_image_step.vw} a
+        join {rowops_step.vw} b on a.pk_hash = b.pk_hash
+      where
+        b.operation in ('I', 'U')
+    """
+
+    self.df = spark.sql(insert_sql)
+
+    return self
+
+
+class TableMaintenance(Step):
+
+  def optimize(self, source, dataset):
+    spark.sql(f'optimize {source}.{dataset}')
+
+  def vaccum(self, source, dataset):
+    spark.sql(f'vacuum {source}.{dataset}')
+
+  def result( self, source, dataset, vacuum_frequency = 7):
+
+    last_optimise_df = spark.sql(f"""describe history {source}.{dataset}""") \
+        .where("operation == 'OPTIMIZE'") \
+        .agg({"timestamp":"max"}) \
+        .withColumnRenamed('max(timestamp)', 'last_optimise') \
+        .withColumn('days_since', F.coalesce(F.datediff(F.current_date(), 'last_optimise'), F.lit(vacuum_frequency)))
+
+    days_since_optimise = last_optimise_df.select('days_since').collect()[0][0]
+
+    if days_since_optimise >= vacuum_frequency:
+        print(f'Optimising & vacuuming: {source}.{dataset}')
+        self.optimize(source=source, dataset=dataset)
+        self.vaccum(source=source, dataset=dataset)
+
+    return self
+
+
+class SCD2_Table_Client:
+    
+  def __init__(self, dataset_configs, environment_config):
+    self.dataset_configs = dataset_configs
+    self.environment_config = environment_config
+    # spark config...
+
+
+  def set_source_dataset(self, source_dataset):
+    
+    self.source = source_dataset.split('.')[0]
+    self.dataset = source_dataset.split('.')[1]
+
+   
+  def process_SCDT2_v2(self, process_date=None):
+    # use strategy pattern for discrete transformation steps so dependency between steps is clear.
+
+    if self.source is None or self.dataset is None:
+      raise Exception("Need to set source and dataset")
+
+    
+    source = self.source
+    dataset = self.dataset
+
+    dataset_config = self.dataset_configs.get_config(source, dataset)
+
+    filename = dataset_config['filename']
+    sql = dataset_config['sql']
+    pk = dataset_config['pk']
+
+    stage_root = self.environment_config.get_source_stage_root(source)
+
+    if process_date is not None:
+        file_path = self.environment_config.get_source_raw_root(source) + process_date+"/"+filename
+    else:
+        file_path = self.environment_config.get_source_raw_root(source) + filename
+
+
+    dataset_step = Dataset().result(file_path=file_path)
+
+    fresh_step = Fresh().result(dataset_step, sql)
+
+    check_dupes_step = CheckDupes().result(fresh_step, pk, source, dataset)
+
+    create_if_not_exists_step = CreateIfNotExist().result(fresh_step, source, dataset, stage_root)
+
+    post_image_step = PostImage().result(fresh_step, pk )
+
+    pre_image_step = PreImage().result(source, dataset)
+
+    compare_post_pre_row_count = ComparePostPreRowCount().result(post_image_step, pre_image_step, raise_on_zero_postimage=True)
+
+    unioned_hashes_step = UnionedHashes().result(post_image_step, pre_image_step)
+
+    now_utc = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+
+    rowops_step = RowOps().result( unioned_hashes_step, now_utc)
+
+    merge = Merge().result(rowops_step, source, dataset)
+
+    insert = Insert().result(post_image_step, rowops_step, source, dataset)
+
+    maintenance = TableMaintenance().result(source=source, dataset=dataset)
+
+
+environment_config = EnvironmentConfig()
+dataset_configs = DatasetConfigs()
+
+
+dataset_configs.build()
+
+client = SCD2_Table_Client(dataset_configs = dataset_configs, environment_config = environment_config)
+
+if isinstance(source_dataset, str):
+    client.set_source_dataset(source_dataset = source_dataset)
+
+    print(f"---------- Processing table: {source_dataset} ----------")
+    print(f"\nBegin processing date: {process_date or 'latest'}")
+
+    start = timer()
+
+    client.process_SCDT2_v2(process_date)
+
+    end = timer()
+
+    print("Processing completed!")
+    print("\t-> Duration:",round(end-start),"seconds")
+
+elif isinstance(source_dataset, list):
+    for d in source_dataset:
+        client.set_source_dataset(source_dataset = d)
+
+        print(f"---------- Processing table: {d} ----------")
+        print(f"\nBegin processing date: {process_date or 'latest'}")
+
+        start = timer()
+
+        client.process_SCDT2_v2(process_date)
+
+        end = timer()
+
+        print("Processing completed!")
+        print("\t-> Duration:",round(end-start),"seconds")
